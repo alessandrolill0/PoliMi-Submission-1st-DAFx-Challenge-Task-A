@@ -44,9 +44,6 @@ class Loss(nn.Module):
             self.target_stft_cache[(device, n_fft)] = target_stft
     
     def forward(self, pred_audio, target_audio):
-        peak = torch.max(torch.abs(target_audio)) + 1e-8
-        norm_target = target_audio / peak
-        norm_pred = pred_audio / peak
         pred_audio = pred_audio.squeeze()
         target_audio = target_audio.squeeze()
 

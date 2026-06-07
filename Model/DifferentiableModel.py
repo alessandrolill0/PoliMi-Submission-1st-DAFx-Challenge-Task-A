@@ -1,8 +1,7 @@
 import torch
-import torchaudio
 import torch.nn as nn
 import numpy as np
-from utils import map_range_linear, map_range_log, map_softplus_linear, map_softplus_log, map_sigm_linear,map_sigm_log
+from utils import map_sigm_linear,map_sigm_log
 class DifferentiableModalPlate(nn.Module):
 
     def __init__(self, sample_rate: int = 44100, plate_params: dict = None,
@@ -18,7 +17,7 @@ class DifferentiableModalPlate(nn.Module):
         self.dtype = dtype
 
         # =========================
-        # 1. FIXED PARAMETERS
+        # 1. FIXED PARAMETERS 
         # =========================
         self.register_buffer('Lx', torch.tensor(1.0, dtype=dtype))
         self.register_buffer('tau_0', torch.tensor(6.0, dtype=dtype))
@@ -76,22 +75,24 @@ class DifferentiableModalPlate(nn.Module):
         device = omega.device
         dtype = omega.dtype
         
-        n = torch.arange(num_samples, device=device, dtype=dtype).unsqueeze(0)  # [1, T]
-        y = torch.zeros(num_samples, device=device, dtype=dtype)
+        n = torch.arange(num_samples, device=device, dtype=dtype).unsqueeze(0)
         
-        chunk_size = 1000
-        for i in range(0, omega.shape[0], chunk_size):
-            o_chunk = omega[i:i+chunk_size].unsqueeze(1)  # [chunk, 1]
-            s_chunk = sigma[i:i+chunk_size].unsqueeze(1)  # [chunk, 1]
-            p_chunk = P[i:i+chunk_size].unsqueeze(1)      # [chunk, 1]
+        y = torch.zeros(num_samples, device=device, dtype=dtype)
 
+        chunk_size = 300
+        for i in range(0, omega.shape[0], chunk_size):
+            o_chunk = omega[i:i+chunk_size].unsqueeze(1) # [Chunk, 1]
+            s_chunk = sigma[i:i+chunk_size].unsqueeze(1) # [Chunk, 1]
+            p_chunk = P[i:i+chunk_size].unsqueeze(1)     # [Chunk, 1]
+            
             sin_omega_k = torch.sin(o_chunk * self.k).clamp_min(1e-12)
             n_minus_1 = torch.clamp(n - 1, min=0)
-
+            
             envelope = torch.exp(-s_chunk * self.k * n_minus_1)
             oscillator = torch.sin(o_chunk * self.k * n)
-
+            
             modes_chunk = (p_chunk / sin_omega_k) * envelope * oscillator
+            
             y += torch.sum(modes_chunk, dim=0)
             
         y[0] = 0.0 
@@ -109,6 +110,18 @@ class DifferentiableModalPlate(nn.Module):
         DDx = 110
         DDy = 439
 
+        '''
+        with torch.no_grad():
+            T0_v  = T0_over_mu.item()
+            D_v   = D_over_mu.item()
+            Ly_v  = Ly.item()
+            disc  = T0_v**2 + 4 * self.maxOm**2 * D_v
+            inner = (-T0_v + np.sqrt(max(disc, 0.0))) / (2 * D_v + 1e-12)
+            s     = np.sqrt(max(inner, 0.0))
+            DDx   = max(int(np.floor(1.0  / np.pi * s)) + 1, 1)
+            DDy   = max(int(np.floor(Ly_v / np.pi * s)) + 1, 1)
+        '''
+        
         m_idx = torch.arange(1, DDx + 1, device=device, dtype=self.dtype)
         n_idx = torch.arange(1, DDy + 1, device=device, dtype=self.dtype)
 
@@ -135,7 +148,7 @@ class DifferentiableModalPlate(nn.Module):
         n_vec = n_vec[valid]
 
         # =========================
-        # 4. DAMPING + COEFFICIENTS
+        # 4. DAMPING + COEFFICIENTI
         # =========================
         sigma = self.alpha + self.beta * omega**2
         exp_term = torch.exp(-sigma * self.k)
@@ -150,6 +163,7 @@ class DifferentiableModalPlate(nn.Module):
 
         ms = 0.25 * mu * self.Lx * Ly
         
+        # Calculate P (Amplitude of force)
         P = 4.0 * OutWeight * InWeight * self.k**2 * exp_term / (ms * self.Lx * Ly)
 
         # =========================
@@ -157,6 +171,7 @@ class DifferentiableModalPlate(nn.Module):
         # =========================
         num_samples = int(self.sample_rate * duration)
         
+        # Using the exact analytical solver instead of lfilter
         y = self.solve_modal_system(omega, sigma, P, num_samples)
 
         if velCalc:
@@ -167,7 +182,6 @@ class DifferentiableModalPlate(nn.Module):
         # 6. NORMALIZATION
         # =========================
         if normalize:
-            # detach prevents peak normalization from blocking gradient flow
             peak = torch.max(torch.abs(y)).detach() + 1e-8
             y = y / peak
 

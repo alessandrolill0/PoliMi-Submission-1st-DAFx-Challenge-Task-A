@@ -112,6 +112,8 @@ def map_softplus_log(x, min_v, max_v, dtype=torch.float32, device='cpu', weight=
     min_v = torch.clamp(min_v, min=eps) 
     max_v = torch.clamp(max_v, min=eps)
     
+    # MODIFICA CRITICA: limitiamo superiormente la softplus a 1.0.
+    # Questo assicura che il valore mappato non superi mai max_v.
     norm_x = torch.clamp(F.softplus(x * weight), max=1.0)
     
     log_min = torch.log(min_v)

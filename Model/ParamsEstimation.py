@@ -1,17 +1,16 @@
 import torch
 import time
-import copy  ### MODIFIED: Added missing import ###
 import numpy as np
+import gc
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 from torch.optim import Adam
-from model import DifferentiableModalPlate
+from Model.DifferentiableModel import DifferentiableModalPlate
 from loss import Loss
-from loss2 import MSELoss
-from torch.optim import Adam
 from utils import load_challenge_npz
-from optimizer import get_optimizer
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from lhs import lhs_sample_raw_params_2d, lhs_sample_raw_params, lhs_sample_raw_params_3d
-from ground_truth import compute_nmse
+from lhs import lhs_sample_raw_params
 import pandas as pd
 from pathlib import Path
 
@@ -21,19 +20,22 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    #target_npz_path = "target/ground_truth_random_42.npz"
-    target_npz_path = "target/2026-DATASET-STRIPPED/random_IR_0007.npz" 
+    target_npz_path = "target/2026-DATASET-STRIPPED/random_IR_0005.npz" 
     sample_rate     = 44100
     num_iterations  = 1500
-    LR              = 0.01
     dtype           = torch.float64
 
     # Multi-start settings
-    n_starts        = 500     
-    probe_iters     = 100  
+    n_starts        = 500   
+    probe_iters     = 100   # short run per LHS start to find best basin
     lhs_seed        = 42
 
+
+    target_stem  = Path(target_npz_path).stem
+    target_index = target_stem.split('_')[-1] if '_' in target_stem else target_stem
+
     target_ir = load_challenge_npz(target_npz_path, device=device, dtype=dtype)
+
     duration = len(target_ir) / sample_rate
     print(f"Target IR loaded: {len(target_ir)} samples ({duration:.2f} seconds)")
 
@@ -47,16 +49,15 @@ def main():
     # ── PHASE 1: Multi-start Exploration (LHS) ────────────────
     print(f"\nPhase 1 — Multi-start exploration: {n_starts} starts, {probe_iters} iters each")
     
-    # 1. Generate raw samples using the LHS function
-    # Expected output: a list of dicts containing the initial raw parameter values
-    raw_samples = lhs_sample_raw_params(n_starts, seed=lhs_seed) 
+    raw_samples = lhs_sample_raw_params(n_starts, seed=lhs_seed)
     best_loss = float('inf')
     best_raw_params = None
+
+    probe_loss_curves = {} 
     
-    probe_duration = 0.2 # 2205 campioni
+    probe_duration = 0.2 
     target_ir_cropped_probe = target_ir[:int(sample_rate * probe_duration)]
-    
-    # Multi-start criterion
+
     criterion_probe = Loss(
         mse_weight=0.0,
         stft_weight=1.0,
@@ -64,7 +65,7 @@ def main():
         fft_sizes=[256, 1024, 2048], 
     ).to(device)
     criterion_probe.precompute_target_stft(target_ir_cropped_probe)
-
+    start_time = time.time()
     for i, init_params in enumerate(raw_samples):
         probe_model = DifferentiableModalPlate(
             sample_rate=sample_rate, 
@@ -85,48 +86,60 @@ def main():
             }
         ])
         
-        for _ in range(probe_iters):
+        probe_loss_curves[i] = []
+
+        skip_probe = False
+        for step in range(probe_iters):
             probe_optimizer.zero_grad(set_to_none=True)
+
             pred_ir = probe_model(duration=probe_duration, normalize=False, velCalc=False)
             loss = criterion_probe(pred_ir, target_ir_cropped_probe)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(probe_model.parameters(), max_norm=1.0)
             probe_optimizer.step()
-            
+
+            probe_loss_curves[i].append(loss.item())
+
+            if step == 19 and loss.item() >= 1.0:
+                skip_probe = True
+                break
+
         final_probe_loss = loss.item()
-        
+
         if (i + 1) % 10 == 0 or i == 0:
-            print(f"  Probe {i+1:03d}/{n_starts} | Loss finale: {final_probe_loss:.4f}")
-            
-        if final_probe_loss < best_loss:
+            status = " [skipped]" if skip_probe else ""
+            print(f"  Probe {i+1:03d}/{n_starts} | Loss finale: {final_probe_loss:.4f}{status}")
+
+        if not skip_probe and final_probe_loss < best_loss:
             best_loss = final_probe_loss
             best_raw_params = {
-                name: param.detach().cpu().item() 
+                name: param.detach().cpu().item()
                 for name, param in probe_model.named_parameters() if param.requires_grad
             }
-            
+
         del probe_model
         del probe_optimizer
         del pred_ir
         del loss
         torch.cuda.empty_cache()
 
-    print(f"\n>>> Best Loss in Phase 1: {best_loss:.4f}")
-    print(">>> Best parameters for Phase 2.")
-    # ──────────────────────────────────────────────────────────
+        if best_loss < 0.4:
+            print(f"  Early stop: probe {i+1} reached loss {best_loss:.4f} < 0.5, skipping remaining probes")
+            break
+
+    print(f"\n>>> Best loss in Phase 1: {best_loss:.4f}")
+    print(">>> Best parameters initialized for Phase 2.")
+    print(">>> Time taken for Phase 1: {:.2f} seconds".format(time.time() - start_time))
 
 
     # ── PHASE 2: Full optimization from best start ────────────────
     print(f"\nPhase 2 — full optimization for {num_iterations} iterations from best start")
 
-    # Initialize the final model using best_raw_params
     model = DifferentiableModalPlate(
         sample_rate=sample_rate,
         plate_params=best_raw_params, 
         dtype=dtype
     ).to(device)
-
-    active_params = filter(lambda p: p.requires_grad, model.parameters())
     
     optimizer = Adam([
         {'params': [model.mu_raw, model.Ly_raw, model.xo_raw, model.yo_raw], 'lr': 0.01},
@@ -140,10 +153,12 @@ def main():
     
     progress = {'iteration': [], 'loss': [], 'mu': [], 'D_over_mu': [], 'T0_over_mu': [], 'Ly': [], 'xo': [], 'yo': []}
 
-    STFT_DURATION = 3.0        
+    STFT_DURATION = 3.0
+    best_loss_phase2   = float('inf')
+    best_params_phase2 = None
+
     # 3. OPTIMIZATION LOOP
     print("\nStarting Optimization")
-    start_time = time.time()
     idx = -1
     for iteration in range(num_iterations):
         idx += 1
@@ -186,8 +201,29 @@ def main():
         # Step 6: Update Parameters
         optimizer.step()
         
-        optimizer.zero_grad()
-        
+        current_loss_val = loss.item()
+
+        # Track best physical parameters only after full-duration phase starts (iteration >= 1000)
+        if current_loss_val < best_loss_phase2:
+            best_loss_phase2 = current_loss_val
+            with torch.no_grad():
+                _mu, _D, _T0, _Ly, _xo, _yo = model.get_physical_parameters()
+                best_params_phase2 = {
+                    'mu':        _mu.item(),
+                    'D_over_mu': _D.item(),
+                    'T0_over_mu':_T0.item(),
+                    'Ly':        _Ly.item(),
+                    'xo':        _xo.item(),
+                    'yo':        _yo.item(),
+                }
+        if current_loss_val < 0.09 and iteration >= 300:
+            print(f" [diag] Early stop at iter {iteration} with loss {current_loss_val:.6f} < 0.05")
+            break
+        optimizer.zero_grad(set_to_none=True)
+        del pred_ir
+        del target_ir_cropped
+        del loss
+        gc.collect()
         torch.cuda.empty_cache()
         
         # Step 7: Print logs and parameter progress
@@ -195,13 +231,13 @@ def main():
             mu, D_over_mu, T0_over_mu, Ly, xo, yo = [
             p.detach().cpu().item() for p in model.get_physical_parameters()
             ]
-            print(f"Iteration {iteration:04d} | Loss: {loss.item():.6f}")
+            print(f"Iteration {iteration:04d} | Loss: {current_loss_val:.6f}")
             print(f"Ly: {Ly:.4f}m | xo: {xo:.4f}m | yo: {yo:.4f}m | "
             f"mu: {mu:.4f} | D/mu: {D_over_mu:.6f} | T0/mu: {T0_over_mu:.6f}")
             print("-" * 60)
 
             progress['iteration'].append(iteration)
-            progress['loss'].append(loss.item())
+            progress['loss'].append(current_loss_val)
             progress['mu'].append(mu)
             progress['D_over_mu'].append(D_over_mu)
             progress['T0_over_mu'].append(T0_over_mu)
@@ -216,9 +252,18 @@ def main():
     print("Training progress saved to target/train_progress.npz")
 
     # 4. RESULTS
-    mu, D_over_mu, T0_over_mu, Ly, xo, yo = [
-    p.detach().cpu().item() for p in model.get_physical_parameters()
-    ]
+    if best_params_phase2 is not None:
+        print(f"\nUsing best Phase 2 parameters (loss={best_loss_phase2:.6f})")
+        mu         = best_params_phase2['mu']
+        D_over_mu  = best_params_phase2['D_over_mu']
+        T0_over_mu = best_params_phase2['T0_over_mu']
+        Ly         = best_params_phase2['Ly']
+        xo         = best_params_phase2['xo']
+        yo         = best_params_phase2['yo']
+    else:
+        mu, D_over_mu, T0_over_mu, Ly, xo, yo = [
+            p.detach().cpu().item() for p in model.get_physical_parameters()
+        ]
     print("\n=== FINAL ESTIMATED PARAMETERS ===")
     print(f"mu := {mu:.6f}")
     print(f"D/mu := {D_over_mu:.6f}")
@@ -228,28 +273,10 @@ def main():
     print(f"yo := {yo:.4f} m")
     print("==================================")
 
-    npz_data  = np.load(target_npz_path)
-    data_keys = npz_data.files
-    overall_nmse = None
-    if 'gt_mu' in data_keys:
-        estimated = {
-            'mu':         mu,
-            'D_over_mu':  D_over_mu,
-            'T0_over_mu': T0_over_mu,
-            'Ly':         Ly,
-            'xo':         xo,
-            'yo':         yo,
-        }
-        _, overall_nmse = compute_nmse(estimated, target_npz_path)
-    else:
-        print("(NMSE skipped: target file has no embedded ground truth params)")
-
+    
     # ── Save results to experiment_results_taskA/ ────────────────
     output_path = Path("experiment_results_taskA")
     output_path.mkdir(exist_ok=True)
-
-    target_stem = Path(target_npz_path).stem
-    target_index = target_stem.split('_')[-1] if '_' in target_stem else target_stem
 
     best_params = {
         'mu':    mu,
@@ -259,35 +286,9 @@ def main():
         'op_x':  xo,
         'op_y':  yo / Ly,
     }
-    pd.DataFrame([best_params]).to_csv(output_path / f"best_params_{target_index}.csv", index=False)
-
-    summary_row = {
-        'target_file':       target_npz_path,
-        'target_index':      target_index,
-        'duration':          round(duration, 6),
-        'optimization_time': round(total_time, 6),
-        'best_loss':         round(progress['loss'][-1], 6),
-        'iterations':    num_iterations,
-    }
-    summary_file = output_path / "experiment_summary.csv"
-    new_row_df   = pd.DataFrame([summary_row])
-    if summary_file.exists():
-        existing = pd.read_csv(summary_file)
-        mask = existing['target_file'] == target_npz_path
-        if mask.any():
-            prev_loss = existing.loc[mask, 'best_loss'].values[0]
-            if summary_row['best_loss'] < prev_loss:
-                existing = existing[~mask]
-                pd.concat([existing, new_row_df], ignore_index=True).to_csv(summary_file, index=False)
-                print(f"\nBetter run (loss {summary_row['best_loss']:.6f} < {prev_loss:.6f}), results updated in {summary_file}")
-            else:
-                print(f"\nPrevious run was better (loss {prev_loss:.6f} <= {summary_row['best_loss']:.6f}), keeping old results")
-        else:
-            pd.concat([existing, new_row_df], ignore_index=True).to_csv(summary_file, index=False)
-            print(f"\nResults saved to {summary_file}")
-    else:
-        new_row_df.to_csv(summary_file, index=False)
-        print(f"\nResults saved to {summary_file}")
+    out_csv = output_path / f"best_params_{target_index}.csv"
+    pd.DataFrame([best_params]).to_csv(out_csv, index=False, float_format='%.17g')
+    print(f"\nResults saved to {out_csv}")
 
 
 
