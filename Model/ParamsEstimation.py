@@ -6,7 +6,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from torch.optim import Adam
-from Model.DifferentiableModel import DifferentiableModalPlate
+from DifferentiableModel import DifferentiableModalPlate
 from loss import Loss
 from utils import load_challenge_npz
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -124,7 +124,7 @@ def main():
         torch.cuda.empty_cache()
 
         if best_loss < 0.4:
-            print(f"  Early stop: probe {i+1} reached loss {best_loss:.4f} < 0.5, skipping remaining probes")
+            print(f"  Early stop: probe {i+1} reached loss {best_loss:.4f} < 0.4, skipping remaining probes")
             break
 
     print(f"\n>>> Best loss in Phase 1: {best_loss:.4f}")
@@ -203,7 +203,6 @@ def main():
         
         current_loss_val = loss.item()
 
-        # Track best physical parameters only after full-duration phase starts (iteration >= 1000)
         if current_loss_val < best_loss_phase2:
             best_loss_phase2 = current_loss_val
             with torch.no_grad():
@@ -217,7 +216,7 @@ def main():
                     'yo':        _yo.item(),
                 }
         if current_loss_val < 0.09 and iteration >= 300:
-            print(f" [diag] Early stop at iter {iteration} with loss {current_loss_val:.6f} < 0.05")
+            print(f" [diag] Early stop at iter {iteration} with loss {current_loss_val:.6f} < 0.09")
             break
         optimizer.zero_grad(set_to_none=True)
         del pred_ir
@@ -247,9 +246,6 @@ def main():
 
     total_time = time.time() - start_time
     print(f"\nOptimization complete in {total_time:.2f} seconds.")
-
-    np.savez('target/train_progress.npz', **{k: np.array(v) for k, v in progress.items()})
-    print("Training progress saved to target/train_progress.npz")
 
     # 4. RESULTS
     if best_params_phase2 is not None:
